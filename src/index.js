@@ -69,9 +69,7 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
 
     if (emoji === SUCCESS_REACTION) {
       rewritten = rewrittenSuccess;
-      statusLine = amount
-        ? `Bet Succeeded Returning $${amount} Amount`
-        : `Bet Succeeded`;
+      statusLine = `Bet Succeeded`;
     } else {
       rewritten = rewrittenFail;
       statusLine = `Bet Failed`;
