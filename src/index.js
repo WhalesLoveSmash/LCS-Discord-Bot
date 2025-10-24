@@ -25,7 +25,7 @@ client.once(Events.ClientReady, (c) => {
   console.log(`${c.user.tag} is online.`);
 });
 
-// Helper: does the message qualify (exact `' Returns '` substring)
+// Helper: does the message qualify (exact ' Returns ')
 function hasExactReturns(text) {
   return text.includes(' Returns ');
 }
@@ -61,14 +61,19 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
 
     // Build the forwarded text
     const amount = extractReturnsAmount(content);
-    const rewritten = content.replace(' Returns ', ' Returned ');
+    const rewrittenSuccess = content.replace(' Returns ', ' Returned ');
+    const rewrittenFail = content.replace(' Returns ', ' To Return ');
 
     let statusLine;
+    let rewritten;
+
     if (emoji === SUCCESS_REACTION) {
+      rewritten = rewrittenSuccess;
       statusLine = amount
         ? `Bet Succeeded Returning $${amount} Amount`
         : `Bet Succeeded`;
     } else {
+      rewritten = rewrittenFail;
       statusLine = `Bet Failed`;
     }
 
@@ -85,10 +90,9 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
   }
 });
 
-// (Optional) ignore bot messages globally
+// Optional: ignore bot messages globally
 client.on(Events.MessageCreate, (m) => {
   if (m.author.bot) return;
-  // no-op; all logic is reaction-based above
 });
 
 client.login(process.env.DISCORD_TOKEN);
