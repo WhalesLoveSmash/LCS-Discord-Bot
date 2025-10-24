@@ -14,7 +14,7 @@ const DOWNVOTE = '👎';
 // track messages we've already forwarded so we don't process twice (for ✅/❌ flow)
 const processed = new Set();
 
-// NEW: Track group bet proposals and votes
+// Track group bet proposals and votes
 // key = source message id
 // value = { proposerId: string, upvoters: Set<string>, downvoters: Set<string>, proposalForwarded: boolean }
 const groupBets = new Map();
@@ -45,12 +45,12 @@ function extractReturnsAmount(text) {
   return m ? m[1] : null;
 }
 
-// NEW: Helper: contains GB (case-insensitive) as a standalone token
+// Helper: contains GB (case-insensitive) as a standalone token
 function hasGB(text) {
   return /\bgb\b/i.test(text);
 }
 
-// NEW: Helper: this is a group bet candidate if it's in the source channel, has ' Returns ', and has GB
+// Helper: this is a group bet candidate if it's in the source channel, has ' Returns ', and has GB
 function isGroupBetMessage(msg) {
   const content = msg.content ?? '';
   return (
@@ -60,7 +60,23 @@ function isGroupBetMessage(msg) {
   );
 }
 
-// NEW: When a group bet is posted, forward proposal right away and auto-react 👍 to represent author's auto-vote
+// NEW: helper to map user IDs -> usernames (best-effort)
+async function idsToUsernames(client, ids) {
+  const arr = Array.from(ids);
+  const names = await Promise.all(
+    arr.map(async (id) => {
+      try {
+        const u = await client.users.fetch(id);
+        return u.username;
+      } catch {
+        return 'Unknown';
+      }
+    })
+  );
+  return names;
+}
+
+// When a group bet is posted, forward proposal right away and auto-react 👍 to represent author's auto-vote
 client.on(Events.MessageCreate, async (msg) => {
   try {
     if (msg.author?.bot) return;
@@ -78,12 +94,11 @@ client.on(Events.MessageCreate, async (msg) => {
 
     const state = groupBets.get(msg.id);
 
-    // Visually show the auto upvote (author's implicit vote). Clicking by author does nothing backend.
-    // If react fails (permissions), ignore silently.
+    // Visually show the auto upvote (author's implicit vote)
     try {
       await msg.react(UPVOTE);
     } catch (e) {
-      // no-op
+      // ignore react failures
     }
 
     // Forward proposal to the output channel once
@@ -92,7 +107,6 @@ client.on(Events.MessageCreate, async (msg) => {
       const files = [...msg.attachments.values()].map((a) => a.url);
       const proposerName = msg.author.username;
 
-      // Initial proposal message -> requires 1 more vote (author auto-votes by rule)
       await target.send({
         content:
           `**${proposerName}** proposed a group bet\n` +
@@ -120,7 +134,7 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
 
     const emoji = reaction.emoji.name;
 
-    // === Guard: If someone reacts in the OUTPUT channel with 👍/👎, tell them to vote in tracking channel and bail ===
+    // Guard: If someone reacts in the OUTPUT channel with 👍/👎, tell them to vote in tracking channel and bail
     if (msg.channelId === TARGET_CHANNEL_ID && (emoji === UPVOTE || emoji === DOWNVOTE)) {
       try {
         const target = await client.channels.fetch(TARGET_CHANNEL_ID);
@@ -160,19 +174,27 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
         // Count an upvote from a different user
         state.upvoters.add(voterId);
 
-        // Thresholds:
-        // - Pass requires 2 total upvotes (author implicit + 1 other). Since author is implicit, we just need 1 here.
+        // Pass requires 2 total upvotes (author implicit + 1 other). Since author is implicit, we just need 1 here.
         const passed = state.upvoters.size >= 1;
 
         if (passed) {
-          // Announce pass
+          // Build voter lists
+          const proposerName = (await client.users.fetch(state.proposerId)).username;
+          const upNames = await idsToUsernames(client, state.upvoters);
+          const forList = [proposerName, ...upNames].join(', ');
+          const againstNames = await idsToUsernames(client, state.downvoters);
+          const againstList = againstNames.length ? againstNames.join(', ') : '—';
+
           await target.send(
-            `**Group bet passed**\n${msg.content}\n${msg.url}`
+            `**Group bet passed**\n` +
+            `${msg.content}\n${msg.url}\n\n` +
+            `**For:** ${forList}\n` +
+            `**Against:** ${againstList}`
           );
-          // No further state required, but we can keep it around; or clear if you prefer:
+          // keep state if you want history; or delete:
           // groupBets.delete(msg.id);
         } else {
-          // (Unreachable with group size 3 & implicit author upvote, but kept for future flexibility)
+          // (kept for future flexibility)
           const remaining = Math.max(0, 1 - state.upvoters.size);
           await target.send(
             `**${user.username}** voted for it — requires **${remaining}** more vote to pass.`
@@ -187,23 +209,24 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
         // Count a downvote from a different user
         state.downvoters.add(voterId);
 
-        // With 3 people, failure requires 2 downvotes from the two *other* members.
+        // With 3 people, failure requires 2 downvotes from the two other members.
         const failed = state.downvoters.size >= 2;
 
         if (failed) {
-          // Get usernames for the two rejectors (best-effort)
-          const names = [];
-          for (const id of state.downvoters) {
-            try {
-              const u = await client.users.fetch(id);
-              names.push(u.username);
-            } catch {
-              names.push('Unknown');
-            }
-          }
-          const proposerName = (await client.users.fetch(state.proposerId)).username;
+          const proposer = await client.users.fetch(state.proposerId);
+          const proposerName = proposer.username;
+
+          const downNames = await idsToUsernames(client, state.downvoters);
+          const downList = downNames.join(', ');
+
+          const upNames = await idsToUsernames(client, state.upvoters);
+          const forList = [proposerName, ...upNames].join(', ');
+
           await target.send(
-            `**Group bet proposal from ${proposerName} was rejected by ${names[0]} and ${names[1]}**\n${msg.content}\n${msg.url}`
+            `**Group bet proposal from ${proposerName} was rejected by ${downList}**\n` +
+            `${msg.content}\n${msg.url}\n\n` +
+            `**For:** ${forList}\n` +
+            `**Against:** ${downList}`
           );
           // groupBets.delete(msg.id);
         } else {
