@@ -15,4 +15,10 @@ client.on('ready', (c) => {
     console.log(`${c.user.tag} is online.`);
 });
 
+client.on('messageCreate', (message) => {
+    if (message.content === 'Returns') {
+        message.reply('detected this as a bet');
+    }
+});
+
 client.login(process.env.DISCORD_TOKEN);
