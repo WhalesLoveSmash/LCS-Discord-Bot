@@ -7,8 +7,17 @@ const TARGET_CHANNEL_ID = '1423455458760327261';
 const SUCCESS_REACTION = '✅';
 const FAIL_REACTION = '❌';
 
-// track messages we've already forwarded so we don't process twice
+// NEW: Voting emojis
+const UPVOTE = '👍';
+const DOWNVOTE = '👎';
+
+// track messages we've already forwarded so we don't process twice (for ✅/❌ flow)
 const processed = new Set();
+
+// NEW: Track group bet proposals and votes
+// key = source message id
+// value = { proposerId: string, upvoters: Set<string>, downvoters: Set<string>, proposalForwarded: boolean }
+const groupBets = new Map();
 
 const client = new Client({
   intents: [
@@ -36,6 +45,71 @@ function extractReturnsAmount(text) {
   return m ? m[1] : null;
 }
 
+// NEW: Helper: contains GB (case-insensitive) as a standalone token
+function hasGB(text) {
+  return /\bgb\b/i.test(text);
+}
+
+// NEW: Helper: this is a group bet candidate if it's in the source channel, has ' Returns ', and has GB
+function isGroupBetMessage(msg) {
+  const content = msg.content ?? '';
+  return (
+    msg.channelId === SOURCE_CHANNEL_ID &&
+    hasExactReturns(content) &&
+    hasGB(content)
+  );
+}
+
+// NEW: When a group bet is posted, forward proposal right away and auto-react 👍 to represent author's auto-vote
+client.on(Events.MessageCreate, async (msg) => {
+  try {
+    if (msg.author?.bot) return;
+    if (!isGroupBetMessage(msg)) return;
+
+    // Initialize tracking if needed
+    if (!groupBets.has(msg.id)) {
+      groupBets.set(msg.id, {
+        proposerId: msg.author.id,
+        upvoters: new Set(),     // other voters (excludes proposer)
+        downvoters: new Set(),   // other voters (excludes proposer)
+        proposalForwarded: false,
+      });
+    }
+
+    const state = groupBets.get(msg.id);
+
+    // Visually show the auto upvote (author's implicit vote). Clicking by author does nothing backend.
+    // If react fails (permissions), ignore silently.
+    try {
+      await msg.react(UPVOTE);
+    } catch (e) {
+      // no-op
+    }
+
+    // Forward proposal to the output channel once
+    if (!state.proposalForwarded) {
+      const target = await client.channels.fetch(TARGET_CHANNEL_ID);
+      const files = [...msg.attachments.values()].map((a) => a.url);
+      const proposerName = msg.author.username;
+
+      // Initial proposal message -> requires 1 more vote (author auto-votes by rule)
+      await target.send({
+        content:
+          `**${proposerName}** proposed a group bet\n` +
+          `Requires **1 more** vote to pass\n` +
+          `${msg.content}\n${msg.url}`,
+        files,
+      });
+
+      state.proposalForwarded = true;
+      groupBets.set(msg.id, state);
+    }
+  } catch (err) {
+    console.error('Group bet forward error:', err);
+  }
+});
+
+// Reactions handler (extends your existing one)
 client.on(Events.MessageReactionAdd, async (reaction, user) => {
   try {
     if (user.bot) return;
@@ -43,6 +117,105 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
     if (reaction.partial) await reaction.fetch();
     const msg = reaction.message;
     if (msg.partial) await msg.fetch();
+
+    const emoji = reaction.emoji.name;
+
+    // === Guard: If someone reacts in the OUTPUT channel with 👍/👎, tell them to vote in tracking channel and bail ===
+    if (msg.channelId === TARGET_CHANNEL_ID && (emoji === UPVOTE || emoji === DOWNVOTE)) {
+      try {
+        const target = await client.channels.fetch(TARGET_CHANNEL_ID);
+        await target.send(`Vote in <#${SOURCE_CHANNEL_ID}> not here.`);
+      } catch (e) {
+        // ignore
+      }
+      return;
+    }
+
+    // === GROUP BET VOTING PATH (👍/👎 on qualifying messages in SOURCE channel) ===
+    if (msg.channelId === SOURCE_CHANNEL_ID && hasExactReturns(msg.content ?? '') && hasGB(msg.content ?? '') && (emoji === UPVOTE || emoji === DOWNVOTE)) {
+      // Ensure state initialized (covers the edge case where bot restarted)
+      if (!groupBets.has(msg.id)) {
+        groupBets.set(msg.id, {
+          proposerId: msg.author?.id ?? '',
+          upvoters: new Set(),
+          downvoters: new Set(),
+          proposalForwarded: false,
+        });
+      }
+
+      const state = groupBets.get(msg.id);
+      const voterId = user.id;
+
+      // Author can't vote (beyond the automatic implicit upvote). Ignore if voter is proposer.
+      if (voterId === state.proposerId) return;
+
+      // Ignore duplicate votes
+      const alreadyUp = state.upvoters.has(voterId);
+      const alreadyDown = state.downvoters.has(voterId);
+      if (alreadyUp || alreadyDown) return;
+
+      const target = await client.channels.fetch(TARGET_CHANNEL_ID);
+
+      if (emoji === UPVOTE) {
+        // Count an upvote from a different user
+        state.upvoters.add(voterId);
+
+        // Thresholds:
+        // - Pass requires 2 total upvotes (author implicit + 1 other). Since author is implicit, we just need 1 here.
+        const passed = state.upvoters.size >= 1;
+
+        if (passed) {
+          // Announce pass
+          await target.send(
+            `**Group bet passed**\n${msg.content}\n${msg.url}`
+          );
+          // No further state required, but we can keep it around; or clear if you prefer:
+          // groupBets.delete(msg.id);
+        } else {
+          // (Unreachable with group size 3 & implicit author upvote, but kept for future flexibility)
+          const remaining = Math.max(0, 1 - state.upvoters.size);
+          await target.send(
+            `**${user.username}** voted for it — requires **${remaining}** more vote to pass.`
+          );
+        }
+
+        groupBets.set(msg.id, state);
+        return;
+      }
+
+      if (emoji === DOWNVOTE) {
+        // Count a downvote from a different user
+        state.downvoters.add(voterId);
+
+        // With 3 people, failure requires 2 downvotes from the two *other* members.
+        const failed = state.downvoters.size >= 2;
+
+        if (failed) {
+          // Get usernames for the two rejectors (best-effort)
+          const names = [];
+          for (const id of state.downvoters) {
+            try {
+              const u = await client.users.fetch(id);
+              names.push(u.username);
+            } catch {
+              names.push('Unknown');
+            }
+          }
+          const proposerName = (await client.users.fetch(state.proposerId)).username;
+          await target.send(
+            `**Group bet proposal from ${proposerName} was rejected by ${names[0]} and ${names[1]}**\n${msg.content}\n${msg.url}`
+          );
+          // groupBets.delete(msg.id);
+        } else {
+          await target.send(`**${user.username}** voted against it.`);
+        }
+
+        groupBets.set(msg.id, state);
+        return;
+      }
+    }
+
+    // === ORIGINAL ✅/❌ RESOLUTION PATH (unchanged behavior) ===
 
     // Only watch the source channel
     if (msg.channelId !== SOURCE_CHANNEL_ID) return;
@@ -52,7 +225,6 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
     if (!hasExactReturns(content)) return;
 
     // Only handle our two reactions
-    const emoji = reaction.emoji.name;
     if (emoji !== SUCCESS_REACTION && emoji !== FAIL_REACTION) return;
 
     // Ensure we only forward once per message
