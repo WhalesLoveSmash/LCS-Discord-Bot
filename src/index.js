@@ -1,291 +1,204 @@
-// index.js
-require('dotenv').config();
-const { Client, IntentsBitField, Partials, Events } = require('discord.js');
-
-const SOURCE_CHANNEL_ID = '1423456145191997481';
-const TARGET_CHANNEL_ID = '1423455458760327261';
-const SUCCESS_REACTION = '✅';
-const FAIL_REACTION = '❌';
-
-// NEW: Voting emojis
-const UPVOTE = '👍';
-const DOWNVOTE = '👎';
-
-// track messages we've already forwarded so we don't process twice (for ✅/❌ flow)
-const processed = new Set();
-
-// Track group bet proposals and votes
-// key = source message id
-// value = { proposerId: string, upvoters: Set<string>, downvoters: Set<string>, proposalForwarded: boolean }
-const groupBets = new Map();
+// src/index.js
+require("dotenv").config();
+const {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  EmbedBuilder,
+} = require("discord.js");
 
 const client = new Client({
   intents: [
-    IntentsBitField.Flags.Guilds,
-    IntentsBitField.Flags.GuildMembers,
-    IntentsBitField.Flags.GuildMessages,
-    IntentsBitField.Flags.GuildMessageReactions,
-    IntentsBitField.Flags.MessageContent,
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMessageReactions,
   ],
   partials: [Partials.Message, Partials.Channel, Partials.Reaction],
 });
 
-client.once(Events.ClientReady, (c) => {
-  console.log(`${c.user.tag} is online.`);
-});
+// --- Configuration (fixed names per your instructions) ---
+const INPUT_CHANNEL_NAME = "bet-tracking";
+const OUTPUT_CHANNEL_NAME = "bet-discusion";
 
-// Helper: does the message qualify (exact ' Returns ')
-function hasExactReturns(text) {
-  return text.includes(' Returns ');
+// Emojis
+const YELLOW_FLAG = "🟡"; // react to original bet on cash out
+const BLACK_CIRCLE = "⚫"; // react to original bet on void
+// A small set of "resolved" checks; if any exist on the original message we ignore cash-out
+const RESOLVED_EMOJIS = new Set(["✅", "✔️", "☑️", "❌", "✖️", "🟥", "🟩"]);
+
+// Utility: is a message content exactly a $ amount like `$5`, `$6.5`, `$0`
+function parseDollarOnlyMessage(content) {
+  const trimmed = content.trim();
+  const m = trimmed.match(/^\$\s*([0-9]+(?:\.[0-9]+)?)$/);
+  if (!m) return null;
+  return Number(m[1]);
 }
 
-// Helper: pull the amount after " Returns $"
-function extractReturnsAmount(text) {
-  const m = text.match(/ Returns \$\s*([0-9]+(?:\.[0-9]{1,2})?)/);
-  return m ? m[1] : null;
-}
-
-// Helper: contains GB (case-insensitive) as a standalone token
-function hasGB(text) {
-  return /\bgb\b/i.test(text);
-}
-
-// Helper: this is a group bet candidate if it's in the source channel, has ' Returns ', and has GB
-function isGroupBetMessage(msg) {
-  const content = msg.content ?? '';
-  return (
-    msg.channelId === SOURCE_CHANNEL_ID &&
-    hasExactReturns(content) &&
-    hasGB(content)
-  );
-}
-
-// NEW: helper to map user IDs -> usernames (best-effort)
-async function idsToUsernames(client, ids) {
-  const arr = Array.from(ids);
-  const names = await Promise.all(
-    arr.map(async (id) => {
-      try {
-        const u = await client.users.fetch(id);
-        return u.username;
-      } catch {
-        return 'Unknown';
-      }
-    })
-  );
-  return names;
-}
-
-// When a group bet is posted, forward proposal right away and auto-react 👍 to represent author's auto-vote
-client.on(Events.MessageCreate, async (msg) => {
-  try {
-    if (msg.author?.bot) return;
-    if (!isGroupBetMessage(msg)) return;
-
-    // Initialize tracking if needed
-    if (!groupBets.has(msg.id)) {
-      groupBets.set(msg.id, {
-        proposerId: msg.author.id,
-        upvoters: new Set(),     // other voters (excludes proposer)
-        downvoters: new Set(),   // other voters (excludes proposer)
-        proposalForwarded: false,
-      });
-    }
-
-    const state = groupBets.get(msg.id);
-
-    // Visually show the auto upvote (author's implicit vote)
-    try {
-      await msg.react(UPVOTE);
-    } catch (e) {
-      // ignore react failures
-    }
-
-    // Forward proposal to the output channel once
-    if (!state.proposalForwarded) {
-      const target = await client.channels.fetch(TARGET_CHANNEL_ID);
-      const files = [...msg.attachments.values()].map((a) => a.url);
-      const proposerName = msg.author.username;
-
-      await target.send({
-        content:
-          `**${proposerName}** proposed a group bet\n` +
-          `Requires **1 more** vote to pass\n` +
-          `${msg.content}\n${msg.url}`,
-        files,
-      });
-
-      state.proposalForwarded = true;
-      groupBets.set(msg.id, state);
-    }
-  } catch (err) {
-    console.error('Group bet forward error:', err);
+// Utility: try to extract the stake from original bet text
+// Heuristics:
+// 1) If there's "Returns $X", we prefer the last $Y that appears BEFORE "Returns"
+// 2) Otherwise choose the smallest $ amount in the message (typical stake < returns)
+function extractStakeFromText(text) {
+  const dollarRegex = /\$([0-9]+(?:\.[0-9]+)?)/g;
+  const allMatches = [];
+  let m;
+  while ((m = dollarRegex.exec(text)) !== null) {
+    allMatches.push({ value: Number(m[1]), index: m.index });
   }
-});
+  if (allMatches.length === 0) return null;
 
-// Reactions handler (extends your existing one)
-client.on(Events.MessageReactionAdd, async (reaction, user) => {
+  const returnsIndex = text.indexOf("Returns");
+  if (returnsIndex !== -1) {
+    const beforeReturns = allMatches.filter((x) => x.index < returnsIndex);
+    if (beforeReturns.length > 0) {
+      // choose the last $ before "Returns" (often the stake listed right before Returns)
+      return beforeReturns[beforeReturns.length - 1].value;
+    }
+  }
+  // Fallback: choose the smallest amount as stake
+  return allMatches.reduce((min, x) => (x.value < min ? x.value : min), allMatches[0].value);
+}
+
+// Utility: format number like 2 decimal places, but keep .0 or .00 minimal if not needed
+function fmtMoney(n) {
+  // keep up to 2 decimals, strip trailing zeros
+  const s = n.toFixed(2);
+  return s.replace(/\.00$/, "").replace(/(\.\d)0$/, "$1");
+}
+
+// Build an embed that shows the original bet content + who/when + jump link
+function buildOriginalBetEmbed(originalMessage) {
+  const embed = new EmbedBuilder()
+    .setColor(0x2b2d31)
+    .setAuthor({
+      name: originalMessage.author?.tag ?? "Unknown",
+      iconURL: originalMessage.author?.displayAvatarURL?.() ?? undefined,
+    })
+    .setDescription(originalMessage.content || "(no text)")
+    .setTimestamp(originalMessage.createdAt)
+    .setFooter({ text: "Original Bet" });
+
+  // If there’s an attachment and it’s an image, include the first image
+  const firstAttachment = originalMessage.attachments?.first();
+  if (firstAttachment && firstAttachment.contentType && firstAttachment.contentType.startsWith("image/")) {
+    embed.setImage(firstAttachment.url);
+  }
+
+  // Add jump link for convenience
   try {
-    if (user.bot) return;
+    const jump = originalMessage.url;
+    if (jump) {
+      embed.addFields({
+        name: "Jump",
+        value: `[Open original message](${jump})`,
+      });
+    }
+  } catch (_) {
+    // ignore if can't build URL
+  }
 
-    if (reaction.partial) await reaction.fetch();
-    const msg = reaction.message;
-    if (msg.partial) await msg.fetch();
+  return embed;
+}
 
-    const emoji = reaction.emoji.name;
-
-    // Guard: If someone reacts in the OUTPUT channel with 👍/👎, tell them to vote in tracking channel and bail
-    if (msg.channelId === TARGET_CHANNEL_ID && (emoji === UPVOTE || emoji === DOWNVOTE)) {
-      try {
-        const target = await client.channels.fetch(TARGET_CHANNEL_ID);
-        await target.send(`Vote in <#${SOURCE_CHANNEL_ID}> not here.`);
-      } catch (e) {
-        // ignore
+// Determine if a message is already resolved (has any of the "resolved" style reactions)
+async function messageAppearsResolved(msg) {
+  try {
+    // Ensure reactions are cached
+    await msg.fetch();
+    for (const [, reaction] of msg.reactions.cache) {
+      const emojiName = reaction.emoji?.name;
+      if (emojiName && RESOLVED_EMOJIS.has(emojiName)) {
+        return true;
       }
+    }
+  } catch (_) {
+    // If fetch fails, be permissive and treat as not resolved
+  }
+  return false;
+}
+
+// Main listener for cash-out / void replies
+client.on("messageCreate", async (message) => {
+  try {
+    // Ignore bots, DMs, and non-replies
+    if (message.author.bot) return;
+    if (!message.guild) return;
+    if (!message.reference || !message.reference.messageId) return;
+
+    // Only process in the input channel
+    const channel = await message.channel.fetch();
+    if (channel?.name !== INPUT_CHANNEL_NAME) return;
+
+    // Content must be exactly a single $ amount (e.g., "$5", "$0")
+    const cashoutAmount = parseDollarOnlyMessage(message.content);
+    if (cashoutAmount === null) return;
+
+    // Fetch the original bet that was replied to
+    const originalMessage = await channel.messages.fetch(message.reference.messageId).catch(() => null);
+    if (!originalMessage) return;
+
+    // Do not process if original bet looks resolved
+    if (await messageAppearsResolved(originalMessage)) return;
+
+    // Find the output channel
+    const outputChannel = message.guild.channels.cache.find(
+      (c) => c.name === OUTPUT_CHANNEL_NAME && c.isTextBased?.()
+    );
+    if (!outputChannel) return;
+
+    // Handle $0 => void
+    if (cashoutAmount === 0) {
+      // React on the ORIGINAL bet in the input channel
+      await originalMessage.react(BLACK_CIRCLE).catch(() => {});
+
+      const embed = buildOriginalBetEmbed(originalMessage);
+
+      await outputChannel.send({
+        embeds: [embed],
+        content: "Voided",
+      });
+
       return;
     }
 
-    // === GROUP BET VOTING PATH (👍/👎 on qualifying messages in SOURCE channel) ===
-    if (msg.channelId === SOURCE_CHANNEL_ID && hasExactReturns(msg.content ?? '') && hasGB(msg.content ?? '') && (emoji === UPVOTE || emoji === DOWNVOTE)) {
-      // Ensure state initialized (covers the edge case where bot restarted)
-      if (!groupBets.has(msg.id)) {
-        groupBets.set(msg.id, {
-          proposerId: msg.author?.id ?? '',
-          upvoters: new Set(),
-          downvoters: new Set(),
-          proposalForwarded: false,
-        });
-      }
+    // Otherwise, cash out
+    // React on the ORIGINAL bet in the input channel with the yellow emoji
+    await originalMessage.react(YELLOW_FLAG).catch(() => {});
 
-      const state = groupBets.get(msg.id);
-      const voterId = user.id;
+    // Try to compute gain/loss vs stake
+    const stake = extractStakeFromText(originalMessage.content || "");
+    let cashoutLine = `Cashed out at $${fmtMoney(cashoutAmount)}`;
 
-      // Author can't vote (beyond the automatic implicit upvote). Ignore if voter is proposer.
-      if (voterId === state.proposerId) return;
+    if (stake !== null && isFinite(stake)) {
+      const diff = cashoutAmount - stake;
+      const abs = Math.abs(diff);
 
-      // Ignore duplicate votes
-      const alreadyUp = state.upvoters.has(voterId);
-      const alreadyDown = state.downvoters.has(voterId);
-      if (alreadyUp || alreadyDown) return;
-
-      const target = await client.channels.fetch(TARGET_CHANNEL_ID);
-
-      if (emoji === UPVOTE) {
-        // Count an upvote from a different user
-        state.upvoters.add(voterId);
-
-        // Pass requires 2 total upvotes (author implicit + 1 other). Since author is implicit, we just need 1 here.
-        const passed = state.upvoters.size >= 1;
-
-        if (passed) {
-          // Build voter lists
-          const proposerName = (await client.users.fetch(state.proposerId)).username;
-          const upNames = await idsToUsernames(client, state.upvoters);
-          const forList = [proposerName, ...upNames].join(', ');
-          const againstNames = await idsToUsernames(client, state.downvoters);
-          const againstList = againstNames.length ? againstNames.join(', ') : '—';
-
-          await target.send(
-            `**Group bet passed**\n` +
-            `${msg.content}\n${msg.url}\n\n` +
-            `**For:** ${forList}\n` +
-            `**Against:** ${againstList}`
-          );
-          // keep state if you want history; or delete:
-          // groupBets.delete(msg.id);
+      // Treat very tiny differences as neutral (floating point / rounding)
+      if (abs >= 0.005) {
+        if (diff > 0) {
+          // match your example wording for gain
+          cashoutLine = `Cashed out for a $${fmtMoney(abs)} gain for $${fmtMoney(cashoutAmount)}`;
         } else {
-          // (kept for future flexibility)
-          const remaining = Math.max(0, 1 - state.upvoters.size);
-          await target.send(
-            `**${user.username}** voted for it — requires **${remaining}** more vote to pass.`
-          );
+          cashoutLine = `Cashed out at a $${fmtMoney(abs)} loss for $${fmtMoney(cashoutAmount)}`;
         }
-
-        groupBets.set(msg.id, state);
-        return;
-      }
-
-      if (emoji === DOWNVOTE) {
-        // Count a downvote from a different user
-        state.downvoters.add(voterId);
-
-        // With 3 people, failure requires 2 downvotes from the two other members.
-        const failed = state.downvoters.size >= 2;
-
-        if (failed) {
-          const proposer = await client.users.fetch(state.proposerId);
-          const proposerName = proposer.username;
-
-          const downNames = await idsToUsernames(client, state.downvoters);
-          const downList = downNames.join(', ');
-
-          const upNames = await idsToUsernames(client, state.upvoters);
-          const forList = [proposerName, ...upNames].join(', ');
-
-          await target.send(
-            `**Group bet proposal from ${proposerName} was rejected by ${downList}**\n` +
-            `${msg.content}\n${msg.url}\n\n` +
-            `**For:** ${forList}\n` +
-            `**Against:** ${downList}`
-          );
-          // groupBets.delete(msg.id);
-        } else {
-          await target.send(`**${user.username}** voted against it.`);
-        }
-
-        groupBets.set(msg.id, state);
-        return;
       }
     }
 
-    // === ORIGINAL ✅/❌ RESOLUTION PATH (unchanged behavior) ===
+    const embed = buildOriginalBetEmbed(originalMessage);
 
-    // Only watch the source channel
-    if (msg.channelId !== SOURCE_CHANNEL_ID) return;
-
-    // Only consider messages with the exact ' Returns ' token
-    const content = msg.content ?? '';
-    if (!hasExactReturns(content)) return;
-
-    // Only handle our two reactions
-    if (emoji !== SUCCESS_REACTION && emoji !== FAIL_REACTION) return;
-
-    // Ensure we only forward once per message
-    if (processed.has(msg.id)) return;
-    processed.add(msg.id);
-
-    // Build the forwarded text
-    const amount = extractReturnsAmount(content);
-    const rewrittenSuccess = content.replace(' Returns ', ' Returned ');
-    const rewrittenFail = content.replace(' Returns ', ' To Return ');
-
-    let statusLine;
-    let rewritten;
-
-    if (emoji === SUCCESS_REACTION) {
-      rewritten = rewrittenSuccess;
-      statusLine = `Bet Succeeded`;
-    } else {
-      rewritten = rewrittenFail;
-      statusLine = `Bet Failed`;
-    }
-
-    // Forward to target channel (include attachments + message link)
-    const target = await client.channels.fetch(TARGET_CHANNEL_ID);
-    const files = [...msg.attachments.values()].map((a) => a.url);
-
-    await target.send({
-      content: `${statusLine}\n${rewritten}\n${msg.url}`,
-      files,
+    await outputChannel.send({
+      embeds: [embed],
+      content: cashoutLine,
     });
   } catch (err) {
-    console.error('Forward error:', err);
+    // Swallow errors to avoid spam; optionally log if you have a logger
+    // console.error("Cash-out handler error:", err);
   }
 });
 
-// Optional: ignore bot messages globally
-client.on(Events.MessageCreate, (m) => {
-  if (m.author.bot) return;
+client.once("ready", () => {
+  console.log(`Logged in as ${client.user.tag}`);
 });
 
 client.login(process.env.DISCORD_TOKEN);
