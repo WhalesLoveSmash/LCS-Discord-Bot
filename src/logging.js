@@ -9,7 +9,7 @@
 // Optional:
 //   LOGGING_START_ISO (default "2025-11-01T00:00:00Z")
 //
-// Public functions you can call from index.js later:
+// Public functions you can call from index.js:
 //   - logBetPlaced({ message, channelName })
 //   - logCashOut({ message, originalMessage, cashoutAmount, gainLoss })
 //   - logVoid({ message, originalMessage })
@@ -38,9 +38,7 @@ let sheets = null;
 // ---------- Helpers ----------
 function haveCreds() {
   if (!SERVICE_EMAIL || !PRIVATE_KEY || !SPREADSHEET_ID) {
-    console.warn(
-      "[logging] Missing Google Sheets env vars; logging disabled until set."
-    );
+    console.warn("[logging] Missing Google Sheets env vars; logging disabled until set.");
     return false;
   }
   return true;
@@ -85,9 +83,7 @@ function parseBetText(text) {
     /^(\w{2})\s+(\S+)\s+(.+?)\s+([+-]?\d+(?:\.\d+)?)\s+\$([0-9]+(?:\.[0-9]+)?)\s+(?:Returns|To\s+Return)\s+\$([0-9]+(?:\.[0-9]+)?)/i;
 
   const m = text.match(re);
-  if (!m) {
-    return null;
-  }
+  if (!m) return null;
 
   const initials = m[1].toUpperCase();
   const bettor = m[2];
@@ -114,8 +110,9 @@ async function ensureTabs() {
   const client = await getSheets();
   if (!client) return false;
 
-  const meta = await client.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
-  const titles = new Set((meta.data.sheets || []).map(s => s.properties?.title));
+  // 1) Get current meta
+  let meta = await client.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
+  let titles = new Set((meta.data.sheets || []).map(s => s.properties?.title));
 
   const requests = [];
 
@@ -140,12 +137,19 @@ async function ensureTabs() {
     requests.push(addSheetReq(TAB_GROUP));
   }
 
+  // 2) If we created any, apply them
   if (requests.length) {
     await client.spreadsheets.batchUpdate({
       spreadsheetId: SPREADSHEET_ID,
       requestBody: { requests },
     });
+    // 3) IMPORTANT: re-fetch meta so we have fresh sheetIds
+    meta = await client.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
+    titles = new Set((meta.data.sheets || []).map(s => s.properties?.title));
   }
+
+  const getSheetIdByTitle = (title) =>
+    (meta.data.sheets || []).find(s => s.properties?.title === title)?.properties?.sheetId;
 
   // Write headers (idempotent via update)
   const headers = [[
@@ -169,7 +173,7 @@ async function ensureTabs() {
   ]];
 
   async function initTab(title) {
-    // Write headers
+    // Header row
     await client.spreadsheets.values.update({
       spreadsheetId: SPREADSHEET_ID,
       range: `${title}!A1:Q1`,
@@ -177,78 +181,64 @@ async function ensureTabs() {
       requestBody: { values: headers },
     });
 
-    // Format header bold, set column widths, money formats
-    await client.spreadsheets.batchUpdate({
-      spreadsheetId: SPREADSHEET_ID,
-      requestBody: {
-        requests: [
-          // Bold header
-          {
-            repeatCell: {
-              range: {
-                sheetId: (meta.data.sheets || []).find(s => s.properties?.title === title)?.properties?.sheetId,
-                startRowIndex: 0,
-                endRowIndex: 1,
+    // Styling & widths should never block appending; make best-effort only
+    try {
+      const sheetId = getSheetIdByTitle(title);
+      if (sheetId == null) return;
+
+      await client.spreadsheets.batchUpdate({
+        spreadsheetId: SPREADSHEET_ID,
+        requestBody: {
+          requests: [
+            // Bold header
+            {
+              repeatCell: {
+                range: { sheetId, startRowIndex: 0, endRowIndex: 1 },
+                cell: { userEnteredFormat: { textFormat: { bold: true } } },
+                fields: "userEnteredFormat.textFormat.bold",
               },
-              cell: {
-                userEnteredFormat: {
-                  textFormat: { bold: true },
+            },
+            // Currency formats for H..K
+            ...["H","I","J","K"].map((col) => ({
+              repeatCell: {
+                range: {
+                  sheetId,
+                  startRowIndex: 1,
+                  startColumnIndex: col.charCodeAt(0) - 65,
+                  endColumnIndex: col.charCodeAt(0) - 65 + 1,
                 },
-              },
-              fields: "userEnteredFormat.textFormat.bold",
-            },
-          },
-          // Set currency formats for H..K (Stake, Returns, Cashout, Gain/Loss)
-          ...["H","I","J","K"].map(col => ({
-            repeatCell: {
-              range: {
-                sheetId: (meta.data.sheets || []).find(s => s.properties?.title === title)?.properties?.sheetId,
-                startRowIndex: 1,
-                startColumnIndex: col.charCodeAt(0) - 65,
-                endColumnIndex: col.charCodeAt(0) - 65 + 1,
-              },
-              cell: {
-                userEnteredFormat: {
-                  numberFormat: { type: "CURRENCY", pattern: "$#,##0.00" },
+                cell: {
+                  userEnteredFormat: {
+                    numberFormat: { type: "CURRENCY", pattern: "$#,##0.00" },
+                  },
                 },
+                fields: "userEnteredFormat.numberFormat",
               },
-              fields: "userEnteredFormat.numberFormat",
-            },
-          })),
-          // Column widths (nice visual)
-          ...[
-            ["A", 155], // timestamp
-            ["B", 120],
-            ["C", 110],
-            ["D", 70],
-            ["E", 140],
-            ["F", 250], // market
-            ["G", 80],
-            ["H", 110],
-            ["I", 110],
-            ["J", 110],
-            ["K", 110],
-            ["L", 140],
-            ["M", 400], // full text
-            ["N", 160],
-            ["O", 140],
-            ["P", 220],
-            ["Q", 160],
-          ].map(([col, px]) => ({
-            updateDimensionProperties: {
-              range: {
-                sheetId: (meta.data.sheets || []).find(s => s.properties?.title === title)?.properties?.sheetId,
-                dimension: "COLUMNS",
-                startIndex: col.charCodeAt(0) - 65,
-                endIndex: col.charCodeAt(0) - 65 + 1,
+            })),
+            // Column widths
+            ...[
+              ["A", 155], ["B", 120], ["C", 110], ["D", 70],  ["E", 140],
+              ["F", 250], ["G", 80],  ["H", 110], ["I", 110], ["J", 110],
+              ["K", 110], ["L", 140], ["M", 400], ["N", 160], ["O", 140],
+              ["P", 220], ["Q", 160],
+            ].map(([col, px]) => ({
+              updateDimensionProperties: {
+                range: {
+                  sheetId,
+                  dimension: "COLUMNS",
+                  startIndex: col.charCodeAt(0) - 65,
+                  endIndex: col.charCodeAt(0) - 65 + 1,
+                },
+                properties: { pixelSize: px },
+                fields: "pixelSize",
               },
-              properties: { pixelSize: px },
-              fields: "pixelSize",
-            },
-          })),
-        ],
-      },
-    });
+            })),
+          ],
+        },
+      });
+    } catch (e) {
+      console.warn("[logging] styling skipped:", e?.message || e);
+    }
   }
 
   await initTab(TAB_INDIVIDUAL);
@@ -342,7 +332,6 @@ function buildRow({
 
 // ---------- Public logging functions ----------
 
-// Log a newly placed bet (call from wherever you create/forward bets)
 async function logBetPlaced({ message, channelName }) {
   try {
     if (!message || !sameOrAfterCutoff(message.createdAt)) return;
@@ -364,10 +353,8 @@ async function logBetPlaced({ message, channelName }) {
   }
 }
 
-// Log a cash out (call at the time you post to #bet-discusion)
 async function logCashOut({ message, originalMessage, cashoutAmount, gainLoss }) {
   try {
-    // We gate by the original bet's timestamp
     const when = originalMessage?.createdAt || new Date();
     if (!sameOrAfterCutoff(when)) return;
 
@@ -391,7 +378,6 @@ async function logCashOut({ message, originalMessage, cashoutAmount, gainLoss })
   }
 }
 
-// Log a void (call at the time you post "Bet Voided")
 async function logVoid({ message, originalMessage }) {
   try {
     const when = originalMessage?.createdAt || new Date();
