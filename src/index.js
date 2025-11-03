@@ -7,8 +7,8 @@ const {
   EmbedBuilder,
 } = require("discord.js");
 
-// Import logging.js so it's connected (for future spreadsheet logging)
-require("./logging.js");
+// Import logging helpers (spreadsheet logging)
+const { logCashOut, logVoid } = require("./logging.js");
 
 const client = new Client({
   intents: [
@@ -121,7 +121,13 @@ client.on("messageCreate", async (message) => {
 
     if (cashoutAmount === 0) {
       await originalMessage.react(BLACK_CIRCLE).catch(() => {});
-      await outputChannel.send(`Bet Voided\n${betLink}`);
+      const sent = await outputChannel.send(`Bet Voided\n${betLink}`);
+
+      // --- minimal addition: log to spreadsheet ---
+      if (typeof logVoid === "function") {
+        await logVoid({ message: sent, originalMessage });
+      }
+      // --------------------------------------------
       return;
     }
 
@@ -130,6 +136,7 @@ client.on("messageCreate", async (message) => {
     const stake = extractStakeFromText(originalMessage.content || "");
     let cashoutLine = `Cashed out at $${fmtMoney(cashoutAmount)}`;
 
+    let gainLossForLog = null;
     if (stake !== null && isFinite(stake)) {
       const diff = cashoutAmount - stake;
       const abs = Math.abs(diff);
@@ -141,9 +148,21 @@ client.on("messageCreate", async (message) => {
           cashoutLine = `Cashed out at a $${fmtMoney(abs)} loss for $${fmtMoney(cashoutAmount)}`;
         }
       }
+      gainLossForLog = diff;
     }
 
-    await outputChannel.send(`${cashoutLine}\n${betLink}`);
+    const sent = await outputChannel.send(`${cashoutLine}\n${betLink}`);
+
+    // --- minimal addition: log to spreadsheet ---
+    if (typeof logCashOut === "function") {
+      await logCashOut({
+        message: sent,
+        originalMessage,
+        cashoutAmount,
+        gainLoss: gainLossForLog,
+      });
+    }
+    // --------------------------------------------
   } catch (err) {
     // console.error("Cash-out handler error:", err);
   }
