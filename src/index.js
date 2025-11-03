@@ -156,7 +156,7 @@ client.on("messageCreate", async (message) => {
 
       await outputChannel.send({
         embeds: [embed],
-        content: "Voided",
+        content: "Bet Voided",
       });
 
       return;
