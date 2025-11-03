@@ -13,6 +13,8 @@
 //   - logBetPlaced({ message, channelName })
 //   - logCashOut({ message, originalMessage, cashoutAmount, gainLoss })
 //   - logVoid({ message, originalMessage })
+//   - logSuccess({ message, originalMessage })      // NEW
+//   - logFailure({ message, originalMessage })      // NEW
 //
 // NOTE: Requiring this file alone does nothing destructive; it just prepares helpers.
 
@@ -403,9 +405,62 @@ async function logVoid({ message, originalMessage }) {
   }
 }
 
+// NEW: success / failure logging (cashout fields left blank)
+async function logSuccess({ message, originalMessage }) {
+  try {
+    const when = originalMessage?.createdAt || new Date();
+    if (!sameOrAfterCutoff(when)) return;
+
+    const parsed = parseBetText((originalMessage && originalMessage.content) || "");
+    const { tab, row } = buildRow({
+      when,
+      event: "SUCCESS",
+      parsed,
+      channelName: message?.channel?.name || "",
+      fullText: (originalMessage && originalMessage.content) || "",
+      authorTag: originalMessage?.author?.tag || "",
+      authorId: originalMessage?.author?.id || "",
+      link: messageLink(originalMessage),
+      messageId: originalMessage?.id || "",
+      cashout: null,
+      gainLoss: null,
+    });
+    await appendRow(tab, row);
+  } catch (e) {
+    console.warn("[logging] logSuccess error:", e?.message || e);
+  }
+}
+
+async function logFailure({ message, originalMessage }) {
+  try {
+    const when = originalMessage?.createdAt || new Date();
+    if (!sameOrAfterCutoff(when)) return;
+
+    const parsed = parseBetText((originalMessage && originalMessage.content) || "");
+    const { tab, row } = buildRow({
+      when,
+      event: "FAILURE",
+      parsed,
+      channelName: message?.channel?.name || "",
+      fullText: (originalMessage && originalMessage.content) || "",
+      authorTag: originalMessage?.author?.tag || "",
+      authorId: originalMessage?.author?.id || "",
+      link: messageLink(originalMessage),
+      messageId: originalMessage?.id || "",
+      cashout: null,
+      gainLoss: null,
+    });
+    await appendRow(tab, row);
+  } catch (e) {
+    console.warn("[logging] logFailure error:", e?.message || e);
+  }
+}
+
 module.exports = {
   parseBetText,
   logBetPlaced,
   logCashOut,
   logVoid,
+  logSuccess,
+  logFailure,
 };

@@ -31,7 +31,7 @@ const processed = new Set();
 const groupBets = new Map();
 
 // Import logging helpers (spreadsheet logging)
-const { logCashOut, logVoid } = require('./logging.js');
+const { logCashOut, logVoid, logSuccess, logFailure } = require('./logging.js');
 
 const client = new Client({
   intents: [
@@ -354,10 +354,18 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
 
     const files = [...msg.attachments.values()].map((a) => a.url);
 
-    await target.send({
+    const sent = await target.send({
       content: `${statusLine}\n${rewritten}\n${msg.url}`,
       files,
     });
+
+    // NEW: log success/failure to the sheet (leave cashout fields blank)
+    if (emoji === SUCCESS_REACTION && typeof logSuccess === 'function') {
+      await logSuccess({ message: sent, originalMessage: msg });
+    }
+    if (emoji === FAIL_REACTION && typeof logFailure === 'function') {
+      await logFailure({ message: sent, originalMessage: msg });
+    }
   } catch (err) {
     console.error('Forward error:', err);
   }
