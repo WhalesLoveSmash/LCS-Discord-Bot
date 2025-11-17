@@ -1,6 +1,7 @@
 // src/logging.js
-// November-only spreadsheet with two tabs: "Individual" (first) and "Group" (second).
-// Ready to serve as a clean backend for your site.
+// November-only spreadsheet backend.
+// We now log everything into the "Group" tab so all bets (group or individual)
+// show up in the same place the site reads from.
 // ----------------------------------------------------
 // Env vars (set later on Railway):
 //   GOOGLE_SERVICE_ACCOUNT_EMAIL
@@ -13,8 +14,8 @@
 //   - logBetPlaced({ message, channelName })
 //   - logCashOut({ message, originalMessage, cashoutAmount, gainLoss })
 //   - logVoid({ message, originalMessage })
-//   - logSuccess({ message, originalMessage })      // NEW
-//   - logFailure({ message, originalMessage })      // NEW
+//   - logSuccess({ message, originalMessage })
+//   - logFailure({ message, originalMessage })
 //
 // NOTE: Requiring this file alone does nothing destructive; it just prepares helpers.
 
@@ -26,6 +27,8 @@ const RAW_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY || "";
 const SPREADSHEET_ID = process.env.GOOGLE_SHEETS_SPREADSHEET_ID || "";
 const LOGGING_START_ISO = process.env.LOGGING_START_ISO || "2025-11-01T00:00:00Z";
 
+// We keep this constant around for compatibility, but we no longer use it
+// to create / select a separate tab.
 const TAB_INDIVIDUAL = "Individual";
 const TAB_GROUP = "Group";
 
@@ -75,8 +78,11 @@ function messageLink(msg) {
 }
 
 // Parse your bet format:
-// "DH Danny Live Nuggests ML -210 $2.42 Returns $3.57"
-// Also accepts "... To Return $3.57"
+// "GB Danny Live Nuggets ML -210 $2.42 Returns $3.57"  -> group bet
+// "DH Danny Live Nuggets ML -210 $2.42 Returns $3.57"  -> individual bet
+// Any first token of length 2:
+//   - "GB" => Group
+//   - anything else => Individual
 function parseBetText(text) {
   if (!text) return null;
 
@@ -94,10 +100,8 @@ function parseBetText(text) {
   const stake = Number(m[5]);
   const returns = Number(m[6]);
 
-  const kind =
-    initials === "DG" ? "Group" :
-    initials === "DH" ? "Individual" :
-    "Unknown";
+  // IMPORTANT: GB = group bet. Any other 2-letter code = individual bet.
+  const kind = initials === "GB" ? "Group" : "Individual";
 
   return { initials, kind, bettor, market, odds, stake, returns };
 }
@@ -107,7 +111,8 @@ function to2(n) {
   return Math.round(Number(n) * 100) / 100;
 }
 
-// Ensure exactly two tabs exist and are formatted nicely
+// Ensure the Group tab exists and is formatted nicely
+// (We no longer auto-create / init an "Individual" tab.)
 async function ensureTabs() {
   const client = await getSheets();
   if (!client) return false;
@@ -130,11 +135,7 @@ async function ensureTabs() {
     };
   }
 
-  // Create Individual FIRST if missing
-  if (!titles.has(TAB_INDIVIDUAL)) {
-    requests.push(addSheetReq(TAB_INDIVIDUAL));
-  }
-  // Create Group SECOND if missing
+  // Create Group tab if missing
   if (!titles.has(TAB_GROUP)) {
     requests.push(addSheetReq(TAB_GROUP));
   }
@@ -156,9 +157,9 @@ async function ensureTabs() {
   // Write headers (idempotent via update)
   const headers = [[
     "Timestamp (ISO)", // A
-    "Event",           // B - BET_PLACED | CASH_OUT | VOID
+    "Event",           // B - BET_PLACED | CASH_OUT | VOID | SUCCESS | FAILURE
     "Kind",            // C - Individual | Group
-    "Initials",        // D - DH | DG
+    "Initials",        // D - DH | GB | etc.
     "Bettor Name",     // E
     "Market",          // F
     "Odds",            // G
@@ -243,7 +244,7 @@ async function ensureTabs() {
     }
   }
 
-  await initTab(TAB_INDIVIDUAL);
+  // Only initialize the Group tab; Individual (if it exists) is left untouched.
   await initTab(TAB_GROUP);
 
   return true;
@@ -282,10 +283,11 @@ async function appendRow(tab, values) {
   }
 }
 
-// Build a row according to headers, choosing correct tab by kind
+// Build a row according to headers, always targeting the Group tab
+// (Kind/Initials still get written into the row, but routing is unified.)
 function buildRow({
   when,             // Date or ISO string
-  event,            // BET_PLACED | CASH_OUT | VOID
+  event,            // BET_PLACED | CASH_OUT | VOID | SUCCESS | FAILURE
   parsed,           // result of parseBetText (or null)
   channelName,
   fullText,
@@ -328,7 +330,8 @@ function buildRow({
     messageId || "",   // Q
   ];
 
-  const tab = kind === "Group" ? TAB_GROUP : TAB_INDIVIDUAL;
+  // IMPORTANT: all bets (GB / DH / DG / NM / whatever) go into the Group tab.
+  const tab = TAB_GROUP;
   return { tab, row };
 }
 
@@ -405,7 +408,7 @@ async function logVoid({ message, originalMessage }) {
   }
 }
 
-// NEW: success / failure logging (cashout fields left blank)
+// success / failure logging (cashout fields left blank)
 async function logSuccess({ message, originalMessage }) {
   try {
     const when = originalMessage?.createdAt || new Date();
